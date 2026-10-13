@@ -14,8 +14,7 @@ COPY requirements.txt .
 # Force la version CPU de torch/torchvision AVANT les autres dépendances
 # (argostranslate/stanza et transformers en ont besoin, et sans ça pip
 # installe la variante CUDA par défaut — inutile sur ce serveur sans GPU).
-RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpuRUN pip install --no-cache-dir -r requirements.txt
 
 COPY install_translation_models.py .
 RUN python install_translation_models.py

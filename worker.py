@@ -31,6 +31,8 @@ from PIL import Image
 from supabase import create_client, Client
 import pytesseract
 import argostranslate.translate
+import torch
+from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -62,6 +64,50 @@ THUMBNAIL_MAX_DIMENSION = 600
 THUMBNAIL_WEBP_QUALITY = 82
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+BUBBLE_MODEL_DIR = os.environ.get("BUBBLE_MODEL_DIR", "/app/models/bubble-detector")
+BUBBLE_CONFIDENCE_THRESHOLD = 0.4
+
+bubble_processor = AutoImageProcessor.from_pretrained(BUBBLE_MODEL_DIR)
+bubble_model = AutoModelForObjectDetection.from_pretrained(BUBBLE_MODEL_DIR)
+bubble_model.eval()
+
+
+def detect_bubbles(local_path: str) -> list[list[int]]:
+    """Détecte les bulles de texte sur une page (RT-DETR-v2, licence Apache-2.0).
+    Renvoie une liste de bbox [x, y, w, h] en pixels, triées haut-en-bas puis
+    gauche-à-droite (approximation simple de l'ordre de lecture — pas une vraie
+    inférence droite-à-gauche pour le manga, à affiner plus tard si besoin)."""
+    with Image.open(local_path) as img:
+        img = img.convert("RGB")
+        inputs = bubble_processor(images=img, return_tensors="pt")
+        with torch.no_grad():
+            outputs = bubble_model(**inputs)
+        target_sizes = torch.tensor([img.size[::-1]])
+        results = bubble_processor.post_process_object_detection(
+            outputs, target_sizes=target_sizes, threshold=BUBBLE_CONFIDENCE_THRESHOLD
+        )[0]
+
+    boxes = []
+    for box in results["boxes"].tolist():
+        x1, y1, x2, y2 = box
+        boxes.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+    boxes.sort(key=lambda b: (b[1], b[0]))
+    return boxes
+
+
+def ocr_bubble(local_path: str, bbox: list[int], source_lang: str) -> str:
+    """OCR sur une bulle isolée (recadrée depuis la page) : le texte d'une
+    bulle appartient à la même réplique, donc pas besoin de regroupement par
+    ligne comme pour l'OCR pleine page."""
+    tess_lang = TESSERACT_LANG_MAP.get(source_lang)
+    if not tess_lang:
+        raise ValueError(f"langue OCR non supportée: {source_lang}")
+
+    x, y, w, h = bbox
+    with Image.open(local_path) as img:
+        crop = img.crop((x, y, x + w, y + h))
+        text = pytesseract.image_to_string(crop, lang=tess_lang)
+    return " ".join(text.split())
 
 # Pattern des URLs publiques Supabase Storage :
 # https://<project>.supabase.co/storage/v1/object/public/<bucket>/<path...>
@@ -566,7 +612,16 @@ def handle_translate(payload: dict) -> dict:
         local_path = None
         try:
             local_path = download_to_temp(url)
-            blocks = ocr_page(local_path, source_lang)
+            bubble_boxes = detect_bubbles(local_path)
+            blocks = [
+                {"text": text, "bbox": bbox}
+                for bbox in bubble_boxes
+                if (text := ocr_bubble(local_path, bbox, source_lang))
+            ]
+            if not blocks:
+                # Repli : aucune bulle détectée, OCR pleine page avec
+                # regroupement par ligne (comportement précédent).
+                blocks = ocr_page(local_path, source_lang)
         finally:
             if local_path and os.path.exists(local_path):
                 os.remove(local_path)

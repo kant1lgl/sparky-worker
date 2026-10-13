@@ -29,6 +29,8 @@ import requests
 from flask import Flask, jsonify, request
 from PIL import Image
 from supabase import create_client, Client
+import pytesseract
+import argostranslate.translate
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -479,13 +481,106 @@ def handle_thumbnail(payload: dict) -> dict:
     supabase.table(table).update({field: public_url}).eq("id", row_id).execute()
     return {"thumbnail_url": public_url}
 
+TESSERACT_LANG_MAP = {"fr": "fra", "en": "eng", "ja": "jpn"}
+SUPPORTED_TRANSLATE_LANGS = {"fr", "en", "ja"}
+OCR_MIN_CONFIDENCE = 40
+
+
+def ocr_page(local_path: str, source_lang: str) -> list[dict]:
+    """OCR direct sur l'image entière (pas de détection de bulles au MVP) :
+    renvoie les blocs de texte détectés avec leur position en pixels."""
+    tess_lang = TESSERACT_LANG_MAP.get(source_lang)
+    if not tess_lang:
+        raise ValueError(f"langue OCR non supportée: {source_lang}")
+
+    with Image.open(local_path) as img:
+        data = pytesseract.image_to_data(img, lang=tess_lang, output_type=pytesseract.Output.DICT)
+
+    blocks = []
+    for i, text in enumerate(data["text"]):
+        text = text.strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if conf < OCR_MIN_CONFIDENCE:
+            continue
+        blocks.append({
+            "text": text,
+            "bbox": [data["left"][i], data["top"][i], data["width"][i], data["height"][i]],
+        })
+    return blocks
+
+
+def handle_translate(payload: dict) -> dict:
+    """
+    payload attendu :
+      {
+        "table": "chapters",
+        "row_id": "<uuid du chapitre>",
+        "pages": ["<url image page 1>", "<url image page 2>", ...],
+        "source_lang": "fr" | "en" | "ja"
+      }
+
+    MVP : pas de détection de bulles, OCR direct (Tesseract) sur l'image
+    entière. Les blocs texte+position sont stockés tels quels pour la langue
+    source, et traduits (Argos) vers les 2 autres langues supportées. Aucune
+    image n'est régénérée : le frontend superpose le texte traduit à la
+    position d'origine (bbox).
+    """
+    row_id = payload["row_id"]
+    pages = payload.get("pages") or []
+    source_lang = payload["source_lang"]
+
+    if source_lang not in SUPPORTED_TRANSLATE_LANGS:
+        raise ValueError(f"source_lang non supportée: {source_lang}")
+
+    target_langs = [l for l in SUPPORTED_TRANSLATE_LANGS if l != source_lang]
+
+    pages_processed = 0
+    blocks_translated = 0
+
+    for page_index, url in enumerate(pages):
+        local_path = None
+        try:
+            local_path = download_to_temp(url)
+            blocks = ocr_page(local_path, source_lang)
+        finally:
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+
+        supabase.table("chapter_translations").upsert({
+            "chapter_id": row_id,
+            "page_index": page_index,
+            "lang": source_lang,
+            "blocks": blocks,
+        }, on_conflict="chapter_id,page_index,lang").execute()
+
+        for target_lang in target_langs:
+            translated_blocks = [
+                {**b, "text": argostranslate.translate.translate(b["text"], source_lang, target_lang)}
+                for b in blocks
+            ]
+            supabase.table("chapter_translations").upsert({
+                "chapter_id": row_id,
+                "page_index": page_index,
+                "lang": target_lang,
+                "blocks": translated_blocks,
+            }, on_conflict="chapter_id,page_index,lang").execute()
+            blocks_translated += len(translated_blocks)
+
+        pages_processed += 1
+
+    return {"pages_processed": pages_processed, "blocks_translated": blocks_translated}
 
 HANDLERS = {
     "ping": handle_ping,
     "malware_scan": handle_malware_scan,
     "duplicate_check": handle_duplicate_check,
     "thumbnail": handle_thumbnail,
-    # "translate": handle_translate,             # à brancher à l'étape pipeline traduction
+    "translate": handle_translate,
 }
 
 

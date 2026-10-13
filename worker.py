@@ -488,7 +488,10 @@ OCR_MIN_CONFIDENCE = 40
 
 def ocr_page(local_path: str, source_lang: str) -> list[dict]:
     """OCR direct sur l'image entière (pas de détection de bulles au MVP) :
-    renvoie les blocs de texte détectés avec leur position en pixels."""
+    regroupe les mots par ligne (Tesseract fournit block/par/line_num) pour
+    traduire des phrases complètes plutôt que des mots isolés sans contexte
+    de phrase, et renvoie les lignes de texte avec leur position (bbox
+    englobante de la ligne)."""
     tess_lang = TESSERACT_LANG_MAP.get(source_lang)
     if not tess_lang:
         raise ValueError(f"langue OCR non supportée: {source_lang}")
@@ -496,10 +499,10 @@ def ocr_page(local_path: str, source_lang: str) -> list[dict]:
     with Image.open(local_path) as img:
         data = pytesseract.image_to_data(img, lang=tess_lang, output_type=pytesseract.Output.DICT)
 
-    blocks = []
-    for i, text in enumerate(data["text"]):
-        text = text.strip()
-        if not text:
+    lines: dict[tuple, dict] = {}
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word:
             continue
         try:
             conf = float(data["conf"][i])
@@ -507,12 +510,29 @@ def ocr_page(local_path: str, source_lang: str) -> list[dict]:
             conf = -1
         if conf < OCR_MIN_CONFIDENCE:
             continue
+
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        left, top = data["left"][i], data["top"][i]
+        right, bottom = left + data["width"][i], top + data["height"][i]
+
+        if key not in lines:
+            lines[key] = {"words": [], "left": left, "top": top, "right": right, "bottom": bottom}
+        line = lines[key]
+        line["words"].append(word)
+        line["left"] = min(line["left"], left)
+        line["top"] = min(line["top"], top)
+        line["right"] = max(line["right"], right)
+        line["bottom"] = max(line["bottom"], bottom)
+
+    blocks = []
+    for key in sorted(lines.keys()):
+        line = lines[key]
+        text = " ".join(line["words"])
         blocks.append({
             "text": text,
-            "bbox": [data["left"][i], data["top"][i], data["width"][i], data["height"][i]],
+            "bbox": [line["left"], line["top"], line["right"] - line["left"], line["bottom"] - line["top"]],
         })
     return blocks
-
 
 def handle_translate(payload: dict) -> dict:
     """

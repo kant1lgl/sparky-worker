@@ -23,6 +23,9 @@ RUN python install_translation_models.py
 COPY download_bubble_model.py .
 RUN python download_bubble_model.py
 
+COPY download_whisper_model.py .
+RUN python download_whisper_model.py
+
 COPY worker.py .
 
 CMD ["python", "worker.py"]

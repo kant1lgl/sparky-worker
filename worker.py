@@ -33,6 +33,7 @@ import pytesseract
 import argostranslate.translate
 import torch
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
+from faster_whisper import WhisperModel
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -590,11 +591,11 @@ def handle_translate(payload: dict) -> dict:
         "source_lang": "fr" | "en" | "ja"
       }
 
-    MVP : pas de détection de bulles, OCR direct (Tesseract) sur l'image
-    entière. Les blocs texte+position sont stockés tels quels pour la langue
-    source, et traduits (Argos) vers les 2 autres langues supportées. Aucune
-    image n'est régénérée : le frontend superpose le texte traduit à la
-    position d'origine (bbox).
+    Détecte les bulles (RT-DETR-v2), OCR par bulle (Tesseract), traduit
+    (Argos) vers les 2 autres langues supportées. Ne touche jamais une ligne
+    déjà marquée reviewed=true (traduction validée/corrigée par le créateur) :
+    une relance du job (nouvelle page, retry) ne doit jamais écraser une
+    correction manuelle.
     """
     row_id = payload["row_id"]
     pages = payload.get("pages") or []
@@ -604,6 +605,13 @@ def handle_translate(payload: dict) -> dict:
         raise ValueError(f"source_lang non supportée: {source_lang}")
 
     target_langs = [l for l in SUPPORTED_TRANSLATE_LANGS if l != source_lang]
+
+    existing = supabase.table("chapter_translations") \
+        .select("page_index, lang") \
+        .eq("chapter_id", row_id) \
+        .eq("reviewed", True) \
+        .execute()
+    reviewed_keys = {(r["page_index"], r["lang"]) for r in (existing.data or [])}
 
     pages_processed = 0
     blocks_translated = 0
@@ -619,21 +627,22 @@ def handle_translate(payload: dict) -> dict:
                 if (text := ocr_bubble(local_path, bbox, source_lang))
             ]
             if not blocks:
-                # Repli : aucune bulle détectée, OCR pleine page avec
-                # regroupement par ligne (comportement précédent).
                 blocks = ocr_page(local_path, source_lang)
         finally:
             if local_path and os.path.exists(local_path):
                 os.remove(local_path)
 
-        supabase.table("chapter_translations").upsert({
-            "chapter_id": row_id,
-            "page_index": page_index,
-            "lang": source_lang,
-            "blocks": blocks,
-        }, on_conflict="chapter_id,page_index,lang").execute()
+        if (page_index, source_lang) not in reviewed_keys:
+            supabase.table("chapter_translations").upsert({
+                "chapter_id": row_id,
+                "page_index": page_index,
+                "lang": source_lang,
+                "blocks": blocks,
+            }, on_conflict="chapter_id,page_index,lang").execute()
 
         for target_lang in target_langs:
+            if (page_index, target_lang) in reviewed_keys:
+                continue
             translated_blocks = [
                 {**b, "text": argostranslate.translate.translate(b["text"], source_lang, target_lang)}
                 for b in blocks
@@ -650,12 +659,83 @@ def handle_translate(payload: dict) -> dict:
 
     return {"pages_processed": pages_processed, "blocks_translated": blocks_translated}
 
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base")
+WHISPER_MODEL_DIR = os.environ.get("WHISPER_MODEL_DIR", "/app/models/whisper")
+whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", download_root=WHISPER_MODEL_DIR)
+
+
+def transcribe_video(local_path: str, source_lang: str | None = None) -> tuple[list[dict], str]:
+    """Transcrit la piste audio d'une vidéo en segments horodatés (Whisper via
+    faster-whisper/CTranslate2, léger sur CPU). Si source_lang est fourni et
+    supporté, force la langue de transcription ; sinon Whisper la détecte lui-même."""
+    lang_code = source_lang if source_lang in SUPPORTED_TRANSLATE_LANGS else None
+    segments, info = whisper_model.transcribe(local_path, language=lang_code, vad_filter=True)
+    segments_list = [
+        {"start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip()}
+        for seg in segments
+        if seg.text.strip()
+    ]
+    detected_lang = lang_code or info.language
+    return segments_list, detected_lang
+
+
+def handle_video_subtitles(payload: dict) -> dict:
+    row_id = payload["row_id"]
+    video_url = payload["video_url"]
+    source_lang = payload.get("source_lang")
+
+    local_path = None
+    try:
+        local_path = download_to_temp(video_url)
+        segments, detected_lang = transcribe_video(local_path, source_lang)
+    finally:
+        if local_path and os.path.exists(local_path):
+            os.remove(local_path)
+
+    if not segments:
+        return {"segments": 0, "languages": 0}
+
+    if detected_lang not in SUPPORTED_TRANSLATE_LANGS:
+        detected_lang = source_lang if source_lang in SUPPORTED_TRANSLATE_LANGS else "fr"
+
+    target_langs = [l for l in SUPPORTED_TRANSLATE_LANGS if l != detected_lang]
+
+    existing = supabase.table("video_subtitles") \
+        .select("lang") \
+        .eq("chapter_id", row_id) \
+        .eq("reviewed", True) \
+        .execute()
+    reviewed_langs = {r["lang"] for r in (existing.data or [])}
+
+    if detected_lang not in reviewed_langs:
+        supabase.table("video_subtitles").upsert({
+            "chapter_id": row_id,
+            "lang": detected_lang,
+            "segments": segments,
+        }, on_conflict="chapter_id,lang").execute()
+
+    for target_lang in target_langs:
+        if target_lang in reviewed_langs:
+            continue
+        translated_segments = [
+            {**seg, "text": argostranslate.translate.translate(seg["text"], detected_lang, target_lang)}
+            for seg in segments
+        ]
+        supabase.table("video_subtitles").upsert({
+            "chapter_id": row_id,
+            "lang": target_lang,
+            "segments": translated_segments,
+        }, on_conflict="chapter_id,lang").execute()
+
+    return {"segments": len(segments), "languages": 1 + len(target_langs)}
+
 HANDLERS = {
     "ping": handle_ping,
     "malware_scan": handle_malware_scan,
     "duplicate_check": handle_duplicate_check,
     "thumbnail": handle_thumbnail,
     "translate": handle_translate,
+    "video_subtitles": handle_video_subtitles,
 }
 
 

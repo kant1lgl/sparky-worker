@@ -34,6 +34,8 @@ import argostranslate.translate
 import torch
 from transformers import AutoImageProcessor, AutoModelForObjectDetection
 from faster_whisper import WhisperModel
+import wave
+import numpy as np
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -664,12 +666,41 @@ WHISPER_MODEL_DIR = os.environ.get("WHISPER_MODEL_DIR", "/app/models/whisper")
 whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", download_root=WHISPER_MODEL_DIR)
 
 
+def extract_audio_array(local_path: str, sample_rate: int = 16000) -> "np.ndarray":
+    """Extrait la piste audio d'une vidéo en PCM 16 bits mono via ffmpeg, et la
+    renvoie comme tableau numpy float32 normalisé [-1, 1]. On passe ce tableau
+    directement à faster-whisper plutôt qu'un chemin de fichier, pour éviter
+    le décodage interne PyAV de la lib (incompatibilité de signature connue
+    entre versions de 'av' sur Python 3.13 : TypeError sur 'metadata_errors')."""
+    audio_fd, audio_path = tempfile.mkstemp(suffix=".wav")
+    os.close(audio_fd)
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", local_path, "-vn", "-ac", "1", "-ar", str(sample_rate),
+             "-f", "wav", audio_path],
+            capture_output=True, text=True, timeout=300,
+        )
+        if proc.returncode != 0 or not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+            raise RuntimeError(f"ffmpeg (extraction audio) erreur (code {proc.returncode}): {proc.stderr}")
+
+        with wave.open(audio_path, "rb") as wf:
+            raw = wf.readframes(wf.getnframes())
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+
+
 def transcribe_video(local_path: str, source_lang: str | None = None) -> tuple[list[dict], str]:
     """Transcrit la piste audio d'une vidéo en segments horodatés (Whisper via
     faster-whisper/CTranslate2, léger sur CPU). Si source_lang est fourni et
-    supporté, force la langue de transcription ; sinon Whisper la détecte lui-même."""
+    supporté, force la langue de transcription ; sinon Whisper la détecte
+    elle-même. L'audio est extrait et décodé via ffmpeg (voir
+    extract_audio_array) plutôt que par le décodage PyAV interne de
+    faster-whisper, qui casse sur cette image."""
     lang_code = source_lang if source_lang in SUPPORTED_TRANSLATE_LANGS else None
-    segments, info = whisper_model.transcribe(local_path, language=lang_code, vad_filter=True)
+    audio_array = extract_audio_array(local_path)
+    segments, info = whisper_model.transcribe(audio_array, language=lang_code, vad_filter=True)
     segments_list = [
         {"start": round(seg.start, 2), "end": round(seg.end, 2), "text": seg.text.strip()}
         for seg in segments

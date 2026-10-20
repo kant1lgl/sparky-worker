@@ -27,5 +27,6 @@ COPY download_whisper_model.py .
 RUN python download_whisper_model.py
 
 COPY worker.py .
+COPY fonts/ ./fonts/
 
 CMD ["python", "worker.py"]

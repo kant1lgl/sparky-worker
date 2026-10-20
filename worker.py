@@ -590,6 +590,11 @@ FONT_DIR = os.environ.get("FONT_DIR", "/app/fonts")
 FONT_LATIN_PATH = os.environ.get("FONT_LATIN_PATH", os.path.join(FONT_DIR, "NotoSans-Bold.ttf"))
 FONT_JP_PATH = os.environ.get("FONT_JP_PATH", os.path.join(FONT_DIR, "NotoSansJP-Bold.ttf"))
 
+for _font_path in (FONT_LATIN_PATH, FONT_JP_PATH):
+    if os.path.exists(_font_path):
+        print(f"[worker] police trouvée: {_font_path} ({os.path.getsize(_font_path)} octets)")
+    else:
+        print(f"[worker] POLICE INTROUVABLE: {_font_path}")
 
 def font_for_lang(lang: str) -> str:
     return FONT_JP_PATH if lang == "ja" else FONT_LATIN_PATH

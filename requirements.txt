@@ -9,3 +9,4 @@ argostranslate==1.9.6
 transformers>=4.50
 huggingface_hub==0.26.3
 faster-whisper>=1.0
+opencv-python-headless

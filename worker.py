@@ -22,6 +22,9 @@ import threading
 import traceback
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+import cv2
+import textwrap
+from PIL import ImageDraw, ImageFont
 
 import imagehash
 import magic
@@ -583,21 +586,126 @@ def ocr_page(local_path: str, source_lang: str) -> list[dict]:
         })
     return blocks
 
+FONT_DIR = os.environ.get("FONT_DIR", "/app/fonts")
+FONT_LATIN_PATH = os.environ.get("FONT_LATIN_PATH", os.path.join(FONT_DIR, "NotoSans-Bold.ttf"))
+FONT_JP_PATH = os.environ.get("FONT_JP_PATH", os.path.join(FONT_DIR, "NotoSansJP-Bold.ttf"))
+
+
+def font_for_lang(lang: str) -> str:
+    return FONT_JP_PATH if lang == "ja" else FONT_LATIN_PATH
+
+
+def erase_text_in_bbox(img_bgr, bbox, pad_ratio: float = 0.06):
+    """Efface UNIQUEMENT l'encre du texte (pixels sombres, séparés du fond par
+    seuillage d'Otsu — s'adapte automatiquement au contraste de chaque bulle,
+    pas de seuil fixe à régler à la main) par inpainting, en laissant le
+    contour de la bulle et le dessin intacts. Suit donc la forme réelle de la
+    bulle au lieu de poser un rectangle neuf dessus."""
+    x, y, w, h = [int(v) for v in bbox]
+    pad_x, pad_y = int(w * pad_ratio), int(h * pad_ratio)
+    x0, y0 = max(0, x - pad_x), max(0, y - pad_y)
+    x1, y1 = min(img_bgr.shape[1], x + w + pad_x), min(img_bgr.shape[0], y + h + pad_y)
+    if x1 <= x0 or y1 <= y0:
+        return img_bgr
+
+    roi = img_bgr[y0:y1, x0:x1]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    _, text_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    text_mask = cv2.dilate(text_mask, np.ones((3, 3), np.uint8), iterations=2)
+
+    img_bgr[y0:y1, x0:x1] = cv2.inpaint(roi, text_mask, 4, cv2.INPAINT_TELEA)
+    return img_bgr
+
+
+def wrap_text_for_box(draw: "ImageDraw.ImageDraw", text: str, font: "ImageFont.FreeTypeFont", avail_w: float, lang: str) -> str:
+    """Découpe le texte pour qu'il tienne en largeur. Le japonais ne se
+    découpe pas par mots (pas d'espaces) : on coupe au caractère."""
+    avg_char_w = max(1.0, draw.textlength("あ" if lang == "ja" else "M", font=font))
+    width_chars = max(1, int(avail_w / avg_char_w))
+    if lang == "ja":
+        return "\n".join(text[i:i + width_chars] for i in range(0, len(text), width_chars))
+    return textwrap.fill(text, width=width_chars)
+
+
+def draw_text_in_bbox(pil_img: "Image.Image", bbox, text: str, lang: str, min_font: int = 9, max_font_ratio: float = 0.32):
+    """Écrit la traduction centrée dans la zone de la bulle, taille de police
+    réduite automatiquement jusqu'à ce que le texte tienne."""
+    text = (text or "").strip()
+    if not text:
+        return pil_img
+
+    x, y, w, h = bbox
+    draw = ImageDraw.Draw(pil_img)
+    font_path = font_for_lang(lang)
+
+    pad_w, pad_h = max(4, int(w * 0.1)), max(4, int(h * 0.1))
+    avail_w, avail_h = max(1, w - 2 * pad_w), max(1, h - 2 * pad_h)
+
+    font_size = max(min_font, int(h * max_font_ratio))
+    font = ImageFont.truetype(font_path, font_size)
+    wrapped = wrap_text_for_box(draw, text, font, avail_w, lang)
+
+    while font_size > min_font:
+        bbox_text = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=4)
+        if (bbox_text[2] - bbox_text[0]) <= avail_w and (bbox_text[3] - bbox_text[1]) <= avail_h:
+            break
+        font_size -= 1
+        font = ImageFont.truetype(font_path, font_size)
+        wrapped = wrap_text_for_box(draw, text, font, avail_w, lang)
+
+    bbox_text = draw.multiline_textbbox((0, 0), wrapped, font=font, align="center", spacing=4)
+    text_w, text_h = bbox_text[2] - bbox_text[0], bbox_text[3] - bbox_text[1]
+    text_x = x + (w - text_w) / 2 - bbox_text[0]
+    text_y = y + (h - text_h) / 2 - bbox_text[1]
+
+    draw.multiline_text((text_x, text_y), wrapped, font=font, fill=(20, 20, 20), align="center", spacing=4)
+    return pil_img
+
+
+def render_translated_page(local_path: str, blocks: list[dict], lang: str) -> str:
+    """Efface le texte d'origine (inpainting, pas un calque) et écrit la
+    traduction à la même place, directement dans les pixels — génère une
+    image complète pour cette langue, comme un scantrad/webtoon officiel."""
+    img_bgr = cv2.imread(local_path)
+    if img_bgr is None:
+        raise ValueError(f"image illisible pour rendu traduit: {local_path}")
+
+    for block in blocks:
+        img_bgr = erase_text_in_bbox(img_bgr, block["bbox"])
+
+    pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    for block in blocks:
+        pil_img = draw_text_in_bbox(pil_img, block["bbox"], block.get("text", ""), lang)
+
+    out_fd, out_path = tempfile.mkstemp(suffix=f"_{lang}.jpg")
+    os.close(out_fd)
+    pil_img.convert("RGB").save(out_path, "JPEG", quality=92)
+    return out_path
+
+
+def upload_translated_page(local_path: str, bucket: str, row_id: str, page_index: int, lang: str) -> str:
+    dest_path = f"chapters/{row_id}/translated/{page_index}_{lang}.jpg"
+    with open(local_path, "rb") as f:
+        supabase.storage.from_(bucket).upload(
+            dest_path, f, {"content-type": "image/jpeg", "upsert": "true"}
+        )
+    return supabase.storage.from_(bucket).get_public_url(dest_path)
+
 def handle_translate(payload: dict) -> dict:
     """
     payload attendu :
       {
         "table": "chapters",
         "row_id": "<uuid du chapitre>",
-        "pages": ["<url image page 1>", "<url image page 2>", ...],
+        "pages": ["<url image page 1>", ...],
         "source_lang": "fr" | "en" | "ja"
       }
 
     Détecte les bulles (RT-DETR-v2), OCR par bulle (Tesseract), traduit
-    (Argos) vers les 2 autres langues supportées. Ne touche jamais une ligne
-    déjà marquée reviewed=true (traduction validée/corrigée par le créateur) :
-    une relance du job (nouvelle page, retry) ne doit jamais écraser une
-    correction manuelle.
+    (Argos) vers les 2 autres langues, puis génère une IMAGE COMPLÈTE par
+    langue (texte original effacé par inpainting, traduction réécrite dans
+    l'image) — pas de superposition côté lecteur. Ne touche jamais une ligne
+    déjà marquée reviewed=true.
     """
     row_id = payload["row_id"]
     pages = payload.get("pages") or []
@@ -619,7 +727,11 @@ def handle_translate(payload: dict) -> dict:
     blocks_translated = 0
 
     for page_index, url in enumerate(pages):
+        parsed = parse_storage_url(url)
+        bucket = parsed[0] if parsed else "chapters"
+
         local_path = None
+        rendered_paths: list[str] = []
         try:
             local_path = download_to_temp(url)
             bubble_boxes = detect_bubbles(local_path)
@@ -630,32 +742,40 @@ def handle_translate(payload: dict) -> dict:
             ]
             if not blocks:
                 blocks = ocr_page(local_path, source_lang)
+
+            if (page_index, source_lang) not in reviewed_keys:
+                supabase.table("chapter_translations").upsert({
+                    "chapter_id": row_id,
+                    "page_index": page_index,
+                    "lang": source_lang,
+                    "blocks": blocks,
+                    "image_url": url,
+                }, on_conflict="chapter_id,page_index,lang").execute()
+
+            for target_lang in target_langs:
+                if (page_index, target_lang) in reviewed_keys:
+                    continue
+                translated_blocks = [
+                    {**b, "text": argostranslate.translate.translate(b["text"], source_lang, target_lang)}
+                    for b in blocks
+                ]
+
+                rendered_path = render_translated_page(local_path, translated_blocks, target_lang)
+                rendered_paths.append(rendered_path)
+                image_url = upload_translated_page(rendered_path, bucket, row_id, page_index, target_lang)
+
+                supabase.table("chapter_translations").upsert({
+                    "chapter_id": row_id,
+                    "page_index": page_index,
+                    "lang": target_lang,
+                    "blocks": translated_blocks,
+                    "image_url": image_url,
+                }, on_conflict="chapter_id,page_index,lang").execute()
+                blocks_translated += len(translated_blocks)
         finally:
-            if local_path and os.path.exists(local_path):
-                os.remove(local_path)
-
-        if (page_index, source_lang) not in reviewed_keys:
-            supabase.table("chapter_translations").upsert({
-                "chapter_id": row_id,
-                "page_index": page_index,
-                "lang": source_lang,
-                "blocks": blocks,
-            }, on_conflict="chapter_id,page_index,lang").execute()
-
-        for target_lang in target_langs:
-            if (page_index, target_lang) in reviewed_keys:
-                continue
-            translated_blocks = [
-                {**b, "text": argostranslate.translate.translate(b["text"], source_lang, target_lang)}
-                for b in blocks
-            ]
-            supabase.table("chapter_translations").upsert({
-                "chapter_id": row_id,
-                "page_index": page_index,
-                "lang": target_lang,
-                "blocks": translated_blocks,
-            }, on_conflict="chapter_id,page_index,lang").execute()
-            blocks_translated += len(translated_blocks)
+            for p in [local_path, *rendered_paths]:
+                if p and os.path.exists(p):
+                    os.remove(p)
 
         pages_processed += 1
 
